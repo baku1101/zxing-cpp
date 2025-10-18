@@ -12,14 +12,21 @@
 #ifdef ZXING_READERS
 #include "GlobalHistogramBinarizer.h"
 #include "HybridBinarizer.h"
+#include "oned/ODOrientationUtils.h"
 #include "MultiFormatReader.h"
 #include "Pattern.h"
 #include "ThresholdBinarizer.h"
 #endif
 
 #include <climits>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace ZXing {
 
@@ -28,10 +35,113 @@ namespace ZXing {
 class LumImage : public Image
 {
 public:
-	using Image::Image;
+        using Image::Image;
 
-	uint8_t* data() { return const_cast<uint8_t*>(Image::data()); }
+        uint8_t* data() { return const_cast<uint8_t*>(Image::data()); }
 };
+
+struct RotatedView
+{
+        LumImage image;
+        double cosA = 0;
+        double sinA = 0;
+        double minX = 0;
+        double minY = 0;
+        double cx = 0;
+        double cy = 0;
+};
+
+static RotatedView RotateLuminance(const ImageView& iv, double angle)
+{
+        RotatedView rot;
+        rot.cosA = std::cos(angle);
+        rot.sinA = std::sin(angle);
+        rot.cx = (iv.width() - 1) / 2.0;
+        rot.cy = (iv.height() - 1) / 2.0;
+
+        auto rotatePoint = [&](double x, double y) {
+                double rx = rot.cosA * (x - rot.cx) - rot.sinA * (y - rot.cy);
+                double ry = rot.sinA * (x - rot.cx) + rot.cosA * (y - rot.cy);
+                return std::pair<double, double>{rx, ry};
+        };
+
+        auto corners = {rotatePoint(0, 0), rotatePoint(iv.width() - 1, 0),
+                                        rotatePoint(iv.width() - 1, iv.height() - 1), rotatePoint(0, iv.height() - 1)};
+
+        double minX = std::numeric_limits<double>::infinity();
+        double maxX = -std::numeric_limits<double>::infinity();
+        double minY = std::numeric_limits<double>::infinity();
+        double maxY = -std::numeric_limits<double>::infinity();
+        for (const auto& [rx, ry] : corners) {
+                minX = std::min(minX, rx);
+                maxX = std::max(maxX, rx);
+                minY = std::min(minY, ry);
+                maxY = std::max(maxY, ry);
+        }
+
+        int outW = static_cast<int>(std::ceil(maxX - minX)) + 1;
+        int outH = static_cast<int>(std::ceil(maxY - minY)) + 1;
+        rot.minX = minX;
+        rot.minY = minY;
+        rot.image = LumImage(outW, outH);
+
+        auto* dst = rot.image.data();
+        std::fill(dst, dst + outW * outH, uint8_t(0xff));
+
+        for (int y = 0; y < outH; ++y) {
+                double ry = minY + y;
+                for (int x = 0; x < outW; ++x) {
+                        double rx = minX + x;
+                        double srcX = rot.cosA * rx + rot.sinA * ry + rot.cx;
+                        double srcY = -rot.sinA * rx + rot.cosA * ry + rot.cy;
+                        if (srcX < 0 || srcX > iv.width() - 1 || srcY < 0 || srcY > iv.height() - 1)
+                                continue;
+
+                        int x0 = static_cast<int>(std::floor(srcX));
+                        int y0 = static_cast<int>(std::floor(srcY));
+                        int x1 = std::min(x0 + 1, iv.width() - 1);
+                        int y1 = std::min(y0 + 1, iv.height() - 1);
+
+                        double fx = srcX - x0;
+                        double fy = srcY - y0;
+
+                        auto sample = [&](int sx, int sy) {
+                                return static_cast<double>(iv.data(sx, sy)[0]);
+                        };
+
+                        double v00 = sample(x0, y0);
+                        double v10 = sample(x1, y0);
+                        double v01 = sample(x0, y1);
+                        double v11 = sample(x1, y1);
+
+                        double interp = (1 - fx) * (1 - fy) * v00 + fx * (1 - fy) * v10 + (1 - fx) * fy * v01 + fx * fy * v11;
+                        dst[y * outW + x] = static_cast<uint8_t>(std::clamp(std::lround(interp), 0l, 255l));
+                }
+        }
+
+        return rot;
+}
+
+static PointF MapRotatedPoint(const RotatedView& rot, PointF p)
+{
+        double rx = rot.minX + p.x;
+        double ry = rot.minY + p.y;
+        double x = rot.cosA * rx + rot.sinA * ry + rot.cx;
+        double y = -rot.sinA * rx + rot.cosA * ry + rot.cy;
+        return {x, y};
+}
+
+static bool HasLinearFormat(const ReaderOptions& opts)
+{
+        auto formats = opts.formats();
+        if (formats.empty())
+                return true;
+        for (auto format : formats) {
+                if (IsLinearBarcode(format))
+                        return true;
+        }
+        return false;
+}
 
 template<typename P>
 static LumImage ExtractLum(const ImageView& iv, P projection)
@@ -170,8 +280,9 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
 #endif
 	LumImagePyramid pyramid(iv, opts.downscaleThreshold() * opts.tryDownscale(), opts.downscaleFactor());
 
-	Barcodes res;
-	int maxSymbols = opts.maxNumberOfSymbols() ? opts.maxNumberOfSymbols() : INT_MAX;
+        Barcodes res;
+        int maxSymbols = opts.maxNumberOfSymbols() ? opts.maxNumberOfSymbols() : INT_MAX;
+        std::shared_ptr<const BitMatrix> orientationBits;
 	for (auto&& iv : pyramid.layers) {
 		auto bitmap = CreateBitmap(opts.binarizer(), iv);
 		for (int close = 0; close <= (closedReader ? 1 : 0); ++close) {
@@ -183,10 +294,14 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
 			}
 
 			// TODO: check if closing after invert would be beneficial
-			for (int invert = 0; invert <= static_cast<int>(opts.tryInvert() && !close); ++invert) {
-				if (invert)
-					bitmap->invert();
-				auto rs = (close ? *closedReader : reader).readMultiple(*bitmap, maxSymbols);
+                        for (int invert = 0; invert <= static_cast<int>(opts.tryInvert() && !close); ++invert) {
+                                if (invert)
+                                        bitmap->invert();
+                                if (!orientationBits && &iv == &pyramid.layers.front() && close == 0 && invert == 0) {
+                                        if (const BitMatrix* bits = bitmap->getBitMatrix())
+                                                orientationBits = std::make_shared<BitMatrix>(bits->copy());
+                                }
+                                auto rs = (close ? *closedReader : reader).readMultiple(*bitmap, maxSymbols);
 				for (auto& r : rs) {
 					if (iv.width() != _iv.width())
 						r.setPosition(Scale(r.position(), _iv.width() / iv.width()));
@@ -201,9 +316,41 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
 					return res;
 			}
 		}
-	}
+        }
 
-	return res;
+        if (res.empty() && orientationBits && HasLinearFormat(opts) && opts.tryRotate()) {
+                if (auto orientation = OneD::EstimateOrientation(*orientationBits)) {
+                        double axisAlignment = std::max(std::abs(dot(orientation->scanDir, PointF{1, 0})),
+                                                        std::abs(dot(orientation->scanDir, PointF{0, 1})));
+                        if (axisAlignment < 0.98) {
+                                double angle = std::atan2(orientation->scanDir.y, orientation->scanDir.x);
+                                auto rotated = RotateLuminance(pyramid.layers.front(), -angle);
+                                ReaderOptions rotatedOpts(opts);
+                                rotatedOpts.setTryRotate(false);
+                                if (opts.maxNumberOfSymbols())
+                                        rotatedOpts.setMaxNumberOfSymbols(static_cast<uint8_t>(std::clamp(maxSymbols, 0, 255)));
+                                auto rotatedResults = ReadBarcodes(rotated.image, rotatedOpts);
+                                for (auto& r : rotatedResults) {
+                                        auto pos = r.position();
+                                        for (auto& pt : pos) {
+                                                PointF mapped = MapRotatedPoint(rotated, PointF(pt.x, pt.y));
+                                                pt = {static_cast<int>(std::lround(mapped.x)),
+                                                      static_cast<int>(std::lround(mapped.y))};
+                                        }
+                                        r.setPosition(std::move(pos));
+                                        r.setReaderOptions(opts);
+                                        if (!Contains(res, r)) {
+                                                r.setReaderOptions(opts);
+                                                res.push_back(std::move(r));
+                                                if (--maxSymbols <= 0)
+                                                        break;
+                                        }
+                                }
+                        }
+                }
+        }
+
+        return res;
 }
 
 #else // ZXING_READERS
