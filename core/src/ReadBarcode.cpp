@@ -16,6 +16,7 @@
 #include "MultiFormatReader.h"
 #include "Pattern.h"
 #include "ThresholdBinarizer.h"
+#include "Point.h"
 #endif
 
 #include <climits>
@@ -129,6 +130,38 @@ static PointF MapRotatedPoint(const RotatedView& rot, PointF p)
         double x = rot.cosA * rx + rot.sinA * ry + rot.cx;
         double y = -rot.sinA * rx + rot.cosA * ry + rot.cy;
         return {x, y};
+}
+
+static bool IsLikelyDuplicateLinear(const Barcode& existing, const Barcode& candidate)
+{
+        if (!IsLinearBarcode(existing.format()) || !IsLinearBarcode(candidate.format()))
+                return false;
+
+        if (existing.format() != candidate.format() || existing.text() != candidate.text())
+                return false;
+
+        auto orientationDiff = [](int a, int b) {
+                int diff = std::abs(a - b) % 360;
+                if (diff > 180)
+                        diff = 360 - diff;
+                if (diff > 90)
+                        diff = 180 - diff;
+                return diff;
+        }(existing.orientation(), candidate.orientation());
+
+        constexpr int kMaxOrientationDiff = 10;
+        if (orientationDiff > kMaxOrientationDiff)
+                return false;
+
+        auto centerOf = [](const QuadrilateralI& pos) {
+                PointF acc(0.0, 0.0);
+                for (const auto& pt : pos)
+                        acc += PointF(pt.x, pt.y);
+                return acc / 4.0;
+        };
+
+        constexpr double kMaxCenterDistance = 40.0;
+        return distance(centerOf(existing.position()), centerOf(candidate.position())) <= kMaxCenterDistance;
 }
 
 static bool HasLinearFormat(const ReaderOptions& opts)
@@ -281,6 +314,13 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
 	LumImagePyramid pyramid(iv, opts.downscaleThreshold() * opts.tryDownscale(), opts.downscaleFactor());
 
         Barcodes res;
+        auto isDuplicateLinear = [&](const Barcode& candidate) {
+                for (const auto& existing : res) {
+                        if (IsLikelyDuplicateLinear(existing, candidate))
+                                return true;
+                }
+                return false;
+        };
         int maxSymbols = opts.maxNumberOfSymbols() ? opts.maxNumberOfSymbols() : INT_MAX;
         std::shared_ptr<const BitMatrix> orientationBits;
 	for (auto&& iv : pyramid.layers) {
@@ -305,12 +345,12 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
 				for (auto& r : rs) {
 					if (iv.width() != _iv.width())
 						r.setPosition(Scale(r.position(), _iv.width() / iv.width()));
-					if (!Contains(res, r)) {
-						r.setReaderOptions(opts);
-						r.setIsInverted(bitmap->inverted());
-						res.push_back(std::move(r));
-						--maxSymbols;
-					}
+                                        if (!Contains(res, r) && !isDuplicateLinear(r)) {
+                                                r.setReaderOptions(opts);
+                                                r.setIsInverted(bitmap->inverted());
+                                                res.push_back(std::move(r));
+                                                --maxSymbols;
+                                        }
 				}
 				if (maxSymbols <= 0)
 					return res;
@@ -339,12 +379,48 @@ Barcodes ReadBarcodes(const ImageView& _iv, const ReaderOptions& opts)
                                         }
                                         r.setPosition(std::move(pos));
                                         r.setReaderOptions(opts);
-                                        if (!Contains(res, r)) {
+                                        if (!Contains(res, r) && !isDuplicateLinear(r)) {
                                                 r.setReaderOptions(opts);
                                                 res.push_back(std::move(r));
                                                 if (--maxSymbols <= 0)
                                                         break;
                                         }
+                                }
+                        }
+                }
+        }
+
+        if (res.size() < static_cast<size_t>(maxSymbols) && HasLinearFormat(opts) && opts.tryRotate()) {
+                const std::vector<int> coarseAngles = {-75, -72, -69, -66, -63, -60, -57, -54, -51, -48, -45, -42, -39,
+                                                      -36, -33, -30, -27, -24, -21, -18, -15, -12, -9, -6, -3, 3, 6, 9,
+                                                      12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57,
+                                                      60, 63, 66, 69, 72, 75};
+
+                for (int deg : coarseAngles) {
+                        if (maxSymbols <= 0)
+                                break;
+
+                        double angle = deg * M_PI / 180.0;
+                        auto rotated = RotateLuminance(pyramid.layers.front(), -angle);
+                        ReaderOptions rotatedOpts(opts);
+                        rotatedOpts.setTryRotate(false);
+                        if (opts.maxNumberOfSymbols())
+                                rotatedOpts.setMaxNumberOfSymbols(static_cast<uint8_t>(std::clamp(maxSymbols, 0, 255)));
+
+                        auto rotatedResults = ReadBarcodes(rotated.image, rotatedOpts);
+                        for (auto& r : rotatedResults) {
+                                auto pos = r.position();
+                                for (auto& pt : pos) {
+                                        PointF mapped = MapRotatedPoint(rotated, PointF(pt.x, pt.y));
+                                        pt = {static_cast<int>(std::lround(mapped.x)),
+                                              static_cast<int>(std::lround(mapped.y))};
+                                }
+                                r.setPosition(std::move(pos));
+                                r.setReaderOptions(opts);
+                                if (!Contains(res, r) && !isDuplicateLinear(r)) {
+                                        res.push_back(std::move(r));
+                                        if (--maxSymbols <= 0)
+                                                break;
                                 }
                         }
                 }
