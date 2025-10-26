@@ -368,6 +368,8 @@ if (ZXING_READERS AND ZXING_ENABLE_1D)
         src/oned/ODMultiUPCEANReader.cpp
         src/oned/ODReader.h
         src/oned/ODReader.cpp
+        src/oned/ODOrientationUtils.h
+        src/oned/ODOrientationUtils.cpp
         src/oned/ODRowReader.h
     )
 endif()
